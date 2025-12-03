@@ -23,6 +23,7 @@ FREE_REQUIRED_MINUTES = 30
 # Service account file (wordt door GitHub workflow geschreven als 'sa.json')
 SA_PATH = "sa.json"
 
+
 # ==========================
 # HELPERS
 # ==========================
@@ -46,15 +47,7 @@ def get_credentials():
 
 
 def load_cars_from_sheet():
-    """
-    Leest tab 'Data' in de sheet.
-    Verwacht:
-      kolom A: License Plate
-      kolom B: City
-      kolom C: Cleaning Score
-      kolom D: Franchise
-      kolom E: ID (resource_id)
-    """
+    """Leest alle auto's uit de Google Sheet."""
     print("📄 Sheet uitlezen...")
     creds = get_credentials()
     service = build("sheets", "v4", credentials=creds)
@@ -67,17 +60,14 @@ def load_cars_from_sheet():
         print("⚠️ Geen data gevonden in sheet.")
         return []
 
-    header = values[0]
     rows = values[1:]
-
     cars = []
+
     for row in rows:
-        # Zorg dat we minstens 5 kolommen hebben
-        row = row + [""] * (5 - len(row))
+        row = row + [""] * (5 - len(row))  # minstens 5 kolommen
 
         license_plate = row[0]
         city = row[1]
-        # cleaning_score = row[2]  # nu niet nodig, maar beschikbaar
         franchise = row[3]
         resource_id_str = row[4]
 
@@ -104,9 +94,7 @@ def load_cars_from_sheet():
 
 
 def fetch_calendar_availability(resource_id: int, start_dt: datetime, end_dt: datetime):
-    """
-    1 bulk-call naar MyWheels voor 10 uur window.
-    """
+    """1 bulk-call naar MyWheels voor 10 uur window."""
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -130,11 +118,8 @@ def fetch_calendar_availability(resource_id: int, start_dt: datetime, end_dt: da
 
     data = r.json()
 
-    # De API kan of een lijst of een object teruggeven; we proberen beide
-    if isinstance(data, list):
-        env = data[0]
-    else:
-        env = data
+    # De API retourneert óf dict, óf list
+    env = data[0] if isinstance(data, list) else data
 
     result = env.get("result", {})
     slots = result.get("availability") or result.get("slots") or []
@@ -143,29 +128,16 @@ def fetch_calendar_availability(resource_id: int, start_dt: datetime, end_dt: da
 
 
 def parse_slot_datetime(s: str) -> datetime:
-    """
-    Probeert slot-start/end naar datetime te parsen.
-    Ondersteunt:
-      - 'YYYY-MM-DD HH:MM'
-      - ISO 'YYYY-MM-DDTHH:MM[:SS][+offset]'
-    """
+    """Parset de datum van MyWheels slot."""
     if not s:
         raise ValueError("Empty datetime string")
 
     s_fixed = s.replace("Z", "+00:00")
 
-    # Eerst ISO proberen
     try:
         return datetime.fromisoformat(s_fixed)
     except ValueError:
-        pass
-
-    # Dan 'YYYY-MM-DD HH:MM'
-    try:
         return datetime.strptime(s, "%Y-%m-%d %H:%M")
-    except ValueError:
-        # Laat falen; beter een harde fout dan stille corruptie
-        raise
 
 
 def merge_blocks(blocks):
@@ -183,36 +155,33 @@ def merge_blocks(blocks):
 
 
 def format_blocks(blocks):
-    """
-    Format als 'HH:MM–HH:MM, HH:MM–HH:MM'.
-    Mag over middernacht gaan; dat maakt niet uit voor HH:MM.
-    """
     return ", ".join(f"{s.strftime('%H:%M')}–{e.strftime('%H:%M')}" for s, e in blocks)
 
 
 def build_availability_for_car(resource_id: int, license_clean: str,
                                start_dt: datetime, end_dt: datetime):
-    """
-    Maakt het Greenwheels-achtige availability-object voor één auto:
-    {
-      "no_availability_all_day": bool,
-      "conflict_tijden": "HH:MM–HH:MM, ..."
-    }
-    """
+    """Bouwt het JSON-object voor één auto."""
     try:
         slots = fetch_calendar_availability(resource_id, start_dt, end_dt)
     except Exception as e:
         print(f"⚠️ Fout bij resource {resource_id}: {e}")
-        # Geen data → behandelen alsof alles vrij (kaart toont dan geen blokkades)
-        return {
-            "no_availability_all_day": False,
-            "conflict_tijden": "",
-        }
+        return {"no_availability_all_day": False, "conflict_tijden": ""}
+
+    # 🔥 FIX: Flatten nested lists
+    flat = []
+    for x in slots:
+        if isinstance(x, list):
+            flat.extend(x)
+        else:
+            flat.append(x)
+    slots = flat
 
     conflict_blocks = []
 
     for slot in slots:
-        # Verwacht veldnamen; pas aan als MyWheels anders heet
+        if not isinstance(slot, dict):
+            continue
+
         available = slot.get("available", True)
         start_str = slot.get("start") or slot.get("from")
         end_str = slot.get("end") or slot.get("to")
@@ -226,58 +195,45 @@ def build_availability_for_car(resource_id: int, license_clean: str,
         except Exception:
             continue
 
-        # Alleen kijken binnen ons window
         if e <= start_dt or s >= end_dt:
             continue
 
-        # Clip aan het window
         s = max(s, start_dt)
         e = min(e, end_dt)
 
         if not available:
             conflict_blocks.append((s, e))
 
-    # Merge overlappende blokken
     conflict_blocks = merge_blocks(conflict_blocks)
 
-    # Bepaal of er ergens een vrije periode van minimaal FREE_REQUIRED_MINUTES is
+    # Bepalen of er vrije tijd is
     free_period_found = False
     current_time = start_dt
     for s, e in conflict_blocks:
-        if s > current_time:
-            free_duration = s - current_time
-            if free_duration >= timedelta(minutes=FREE_REQUIRED_MINUTES):
-                free_period_found = True
-                break
+        if s > current_time and (s - current_time) >= timedelta(minutes=FREE_REQUIRED_MINUTES):
+            free_period_found = True
+            break
         current_time = max(current_time, e)
 
-    if current_time < end_dt:
-        remaining_time = end_dt - current_time
-        if remaining_time >= timedelta(minutes=FREE_REQUIRED_MINUTES):
-            free_period_found = True
+    if current_time < end_dt and (end_dt - current_time) >= timedelta(minutes=FREE_REQUIRED_MINUTES):
+        free_period_found = True
 
     no_availability_all_day = not free_period_found
 
-    # Alleen marges corrigeren als auto niet volledig bezet is
+    # Alleen marges toepassen als hij niet volledig bezet is
     if not no_availability_all_day:
         corrected = []
         for s, e in conflict_blocks:
-            corrected_start = s
-            corrected_end = e
-
-            # marge 15 min aan eind en begin, behalve aan randen van het window
             if e < end_dt:
-                corrected_end = e - timedelta(minutes=BLOCK_MINUTES)
+                e -= timedelta(minutes=BLOCK_MINUTES)
             if s > start_dt:
-                corrected_start = s + timedelta(minutes=BLOCK_MINUTES)
+                s += timedelta(minutes=BLOCK_MINUTES)
+            if e > s:
+                corrected.append((s, e))
 
-            if corrected_end > corrected_start:
-                corrected.append((corrected_start, corrected_end))
+        conflict_blocks = merge_blocks(corrected)
 
-        conflict_blocks = corrected
-        conflict_blocks = merge_blocks(conflict_blocks)
-
-    conflict_str = format_blocks(conflict_blocks) if conflict_blocks else ""
+    conflict_str = format_blocks(conflict_blocks)
 
     return {
         "no_availability_all_day": no_availability_all_day,
@@ -286,7 +242,6 @@ def build_availability_for_car(resource_id: int, license_clean: str,
 
 
 def main():
-    # Start & eind in local time (we laten tz hier buiten; MyWheels gebruikt lokale tijden)
     now = datetime.now().replace(second=0, microsecond=0)
     start_dt = now
     end_dt = now + timedelta(hours=WINDOW_HOURS)
@@ -309,10 +264,9 @@ def main():
         entry = build_availability_for_car(rid, lic_clean, start_dt, end_dt)
         availability[lic_clean] = entry
 
-        # Klein sleepje om 429 risico nog kleiner te maken
-        time.sleep(0.2)
+        time.sleep(0.2)  # anti-429
 
-    # JSON wegschrijven
+    # JSON wegschrijven (in de repo root)
     out_path = "availability.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(availability, f, ensure_ascii=False, indent=2)
