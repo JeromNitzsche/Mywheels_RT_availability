@@ -313,7 +313,7 @@ def main():
         time.sleep(0.2)
 
     # JSON wegschrijven
-    out_path = os.path.join("availability", "availability.json")
+    out_path = "availability.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(availability, f, ensure_ascii=False, indent=2)
 
