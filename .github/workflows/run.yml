@@ -9,9 +9,15 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write   # <-- NODIG voor pushen
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v3
+        with:
+          persist-credentials: true
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -28,3 +34,11 @@ jobs:
         run: |
           echo "$GOOGLE_APPLICATION_CREDENTIALS_JSON" > sa.json
           python main.py
+
+      - name: Commit & push availability.json
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git add availability/availability.json || true
+          git commit -m "Update availability.json" || true
+          git push || true
