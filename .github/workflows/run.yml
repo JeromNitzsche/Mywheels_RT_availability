@@ -39,6 +39,6 @@ jobs:
         run: |
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@github.com"
-          git add availability/availability.json || true
+          git add availability.json || true
           git commit -m "Update availability.json" || true
           git push || true
