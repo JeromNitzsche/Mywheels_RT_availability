@@ -214,10 +214,11 @@ def build_availability_for_car(resource_id, start_dt, end_dt):
     if not no_availability_all_day:
         corrected = []
         for s, e in conflict_blocks:
-            if e < end_dt:
-                e -= timedelta(minutes=BLOCK_MINUTES)
-            if s > start_dt:
-                s += timedelta(minutes=BLOCK_MINUTES)
+            #  ❌ DEZE REGELS WEG:
+            # if e < end_dt:
+            #     e -= timedelta(minutes=BLOCK_MINUTES)
+            # if s > start_dt:
+            #     s += timedelta(minutes=BLOCK_MINUTES)
             if e > s:
                 corrected.append((s, e))
         conflict_blocks = merge_blocks(corrected)
