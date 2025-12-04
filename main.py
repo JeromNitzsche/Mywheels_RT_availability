@@ -234,24 +234,14 @@ def fetch_calendar_availability(resource_id: int, start_dt: datetime, end_dt: da
 # AVAILABILITY VOOR ÉÉN AUTO
 # ==========================
 
-def build_availability_for_car(
-    resource_id: int,
-    license_clean: str,
-    start_dt: datetime,
-    end_dt: datetime,
-):
-    """
-    Maakt het Greenwheels-achtige availability-object voor één auto:
-    {
-      "no_availability_all_day": bool,
-      "conflict_tijden": "HH:MM–HH:MM, ..."
-    }
-    """
+def build_availability_for_car(resource_id: int, license_clean: str,
+                               start_dt: datetime, end_dt: datetime):
+
+    # Haal MyWheels blokken op
     try:
         slots = fetch_calendar_availability(resource_id, start_dt, end_dt)
     except Exception as e:
         print(f"⚠️ Fout bij resource {resource_id}: {e}")
-        # Geen data → behandelen alsof alles vrij (kaart toont dan geen blokkades)
         return {
             "no_availability_all_day": False,
             "conflict_tijden": "",
@@ -259,79 +249,76 @@ def build_availability_for_car(
 
     conflict_blocks = []
 
+    # MyWheels geeft BEZETTE BLOKKEN met:
+    # startDate, endDate, refuelTime
     for slot in slots:
         if not isinstance(slot, dict):
             continue
-
-        # Probeer verschillende veldnamen voor 'available'
-        available = slot.get("available")
-        if available is None:
-            available = slot.get("isAvailable")
-        if available is None:
-            # Als er geen info is, gaan we ervan uit dat het geen blokkade is
-            # (anders zouden we alles dichtgooien)
-            continue
-
-        start_str = slot.get("start") or slot.get("from") or slot.get("begin")
-        end_str = slot.get("end") or slot.get("to") or slot.get("until")
+        
+        start_str = slot.get("startDate")
+        end_str   = slot.get("endDate")
+        refuel    = slot.get("refuelTime", 0)
 
         if not start_str or not end_str:
             continue
-
+        
         try:
             s = parse_slot_datetime(start_str)
             e = parse_slot_datetime(end_str)
         except Exception:
             continue
 
-        # Alleen kijken binnen ons window
+        # refuelTime toevoegen → "uitloop-blokkade"
+        if isinstance(refuel, (int, float)):
+            e += timedelta(minutes=refuel)
+
+        # Alleen blokken in ons window
         if e <= start_dt or s >= end_dt:
             continue
 
-        # Clip aan het window
+        # Clip aan window
         s = max(s, start_dt)
         e = min(e, end_dt)
 
-        # We beschouwen "niet available" als conflict
-        if not available:
-            conflict_blocks.append((s, e))
+        conflict_blocks.append((s, e))
 
     # Merge overlappende blokken
     conflict_blocks = merge_blocks(conflict_blocks)
 
-    # Bepaal of er ergens een vrije periode van minimaal FREE_REQUIRED_MINUTES is
+    # Zoek of er 30 min vrije ruimte is
     free_period_found = False
-    current_time = start_dt
+    current = start_dt
+
     for s, e in conflict_blocks:
-        if s > current_time:
-            free_duration = s - current_time
-            if free_duration >= timedelta(minutes=FREE_REQUIRED_MINUTES):
+        if s > current:
+            if (s - current) >= timedelta(minutes=FREE_REQUIRED_MINUTES):
                 free_period_found = True
                 break
-        current_time = max(current_time, e)
+        current = max(current, e)
 
-    if current_time < end_dt:
-        remaining_time = end_dt - current_time
-        if remaining_time >= timedelta(minutes=FREE_REQUIRED_MINUTES):
+    # Check na laatste blok
+    if current < end_dt:
+        if (end_dt - current) >= timedelta(minutes=FREE_REQUIRED_MINUTES):
             free_period_found = True
 
     no_availability_all_day = not free_period_found
 
-    # Alleen marges corrigeren als auto niet volledig bezet is
+    # Marge: alleen als auto NIET all-day bezet is
     if not no_availability_all_day:
         corrected = []
+
         for s, e in conflict_blocks:
-            corrected_start = s
-            corrected_end = e
+            new_s = s
+            new_e = e
 
-            # marge 15 min aan eind en begin, behalve aan randen van het window
             if e < end_dt:
-                corrected_end = e - timedelta(minutes=BLOCK_MINUTES)
-            if s > start_dt:
-                corrected_start = s + timedelta(minutes=BLOCK_MINUTES)
+                new_e -= timedelta(minutes=BLOCK_MINUTES)
 
-            if corrected_end > corrected_start:
-                corrected.append((corrected_start, corrected_end))
+            if s > start_dt:
+                new_s += timedelta(minutes=BLOCK_MINUTES)
+
+            if new_e > new_s:
+                corrected.append((new_s, new_e))
 
         conflict_blocks = merge_blocks(corrected)
 
