@@ -13,15 +13,14 @@ from googleapiclient.discovery import build
 
 API_URL = "https://prod-api.mywheels.nl/api/"
 SHEET_ID = "1WqOPUbMvW3zF6NG5ZFQbJ4FJifsAwKGUsux1hjwMljM"
-SHEET_RANGE = "Data!A:E"  # A: License, B: City, C: Score, D: Franchise, E: ID
+SHEET_RANGE = "Data!A:E"
 
-# Window & blokken
-BLOCK_MINUTES = 15          # marge per kant als auto NIET full-day bezet is
-WINDOW_HOURS = 10           # vooruitkijk-window
-FREE_REQUIRED_MINUTES = 30  # minimaal vrije blok voor "niet full-day bezet"
-
-# Service account file (wordt door GitHub workflow geschreven als 'sa.json')
+BLOCK_MINUTES = 15
+WINDOW_HOURS = 10
+FREE_REQUIRED_MINUTES = 30
 SA_PATH = "sa.json"
+
+SESSION = requests.Session()   # <-- 🔥 SNELHEID BOOST
 
 
 # ==========================
@@ -29,7 +28,6 @@ SA_PATH = "sa.json"
 # ==========================
 
 def clean_license(lic: str) -> str:
-    """Maak kenteken geschikt als JSON-key: alle streepjes/spaties eruit."""
     if lic is None:
         return ""
     return "".join(ch for ch in lic.replace(" ", "").replace("-", "").upper())
@@ -40,22 +38,12 @@ def get_credentials():
         "https://www.googleapis.com/auth/spreadsheets.readonly",
         "https://www.googleapis.com/auth/drive.readonly",
     ]
-    creds = service_account.Credentials.from_service_account_file(
+    return service_account.Credentials.from_service_account_file(
         SA_PATH, scopes=scopes
     )
-    return creds
 
 
 def load_cars_from_sheet():
-    """
-    Leest tab 'Data' in de sheet.
-    Verwacht:
-      kolom A: License Plate
-      kolom B: City
-      kolom C: Cleaning Score
-      kolom D: Franchise
-      kolom E: ID (resource_id)
-    """
     print("📄 Sheet uitlezen...")
     creds = get_credentials()
     service = build("sheets", "v4", credentials=creds)
@@ -68,67 +56,39 @@ def load_cars_from_sheet():
         print("⚠️ Geen data gevonden in sheet.")
         return []
 
-    rows = values[1:]  # header overslaan
+    rows = values[1:]  # header skippen
 
     cars = []
     for row in rows:
-        # Zorg dat we minstens 5 kolommen hebben
         row = row + [""] * (5 - len(row))
+        license_plate, city, _, franchise, rid = row
 
-        license_plate = row[0]
-        city = row[1]
-        franchise = row[3]
-        resource_id_str = row[4]
-
-        if not resource_id_str:
+        if not rid:
             continue
 
         try:
-            resource_id = int(resource_id_str)
+            resource_id = int(rid)
         except ValueError:
             continue
 
-        cars.append(
-            {
-                "resource_id": resource_id,
-                "license_raw": license_plate,
-                "license_clean": clean_license(license_plate),
-                "city": city,
-                "franchise": franchise,
-            }
-        )
+        cars.append({
+            "resource_id": resource_id,
+            "license_clean": clean_license(license_plate),
+        })
 
     print(f"🚗 {len(cars)} auto's geladen uit sheet.")
     return cars
 
 
 def parse_slot_datetime(s: str) -> datetime:
-    """
-    Probeert slot-start/end naar datetime te parsen.
-    Ondersteunt:
-      - 'YYYY-MM-DD HH:MM'
-      - ISO 'YYYY-MM-DDTHH:MM[:SS][+offset]'
-    """
-    if not s:
-        raise ValueError("Empty datetime string")
-
     s_fixed = s.replace("Z", "+00:00")
-
-    # Eerst ISO proberen
     try:
         return datetime.fromisoformat(s_fixed)
     except ValueError:
-        pass
-
-    # Dan 'YYYY-MM-DD HH:MM'
-    try:
         return datetime.strptime(s, "%Y-%m-%d %H:%M")
-    except ValueError:
-        raise
 
 
 def merge_blocks(blocks):
-    """Merge overlappende tijdsblokken (lijst van (start, eind))."""
     if not blocks:
         return []
     blocks = sorted(blocks, key=lambda x: x[0])
@@ -143,10 +103,6 @@ def merge_blocks(blocks):
 
 
 def format_blocks(blocks):
-    """
-    Format als 'HH:MM–HH:MM, HH:MM–HH:MM'.
-    Mag over middernacht gaan; dat maakt niet uit voor HH:MM.
-    """
     return ", ".join(f"{s.strftime('%H:%M')}–{e.strftime('%H:%M')}" for s, e in blocks)
 
 
@@ -154,18 +110,10 @@ def format_blocks(blocks):
 # API CALL
 # ==========================
 
-DEBUG_LOG_DONE = False  # zorgt dat we maar 1 debug-output printen
+DEBUG_LOG_DONE = False
 
 
-def fetch_calendar_availability(resource_id: int, start_dt: datetime, end_dt: datetime):
-    """
-    Roept search.calendarAvailability aan en geeft een lijst met slots terug.
-    Elk slot is idealiter een dict met:
-      - start / from
-      - end / to
-      - available / isAvailable (True/False)
-    Als de structuur anders is of leeg blijft, geven we een lege lijst terug.
-    """
+def fetch_calendar_availability(resource_id, start_dt, end_dt, retries=3):
     global DEBUG_LOG_DONE
 
     payload = {
@@ -181,152 +129,102 @@ def fetch_calendar_availability(resource_id: int, start_dt: datetime, end_dt: da
         },
     }
 
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
-    r = requests.post(API_URL, json=payload, headers=headers, timeout=20)
-    r.raise_for_status()
-
-    data = r.json()
-
-    # Debug één keer de ruwe response, zodat we later kunnen tweaken
-    if not DEBUG_LOG_DONE:
-        print("\n================ DEBUG MYWHEELS RESPONSE ================\n")
+    for attempt in range(retries):
         try:
-            print(json.dumps(data, indent=2))
-        except Exception:
-            print(data)
-        print("\n==========================================================\n")
-        DEBUG_LOG_DONE = True
+            r = SESSION.post(API_URL, json=payload, headers=headers, timeout=10)
+            r.raise_for_status()
+            data = r.json()
 
-    # MyWheels kan lijst of dict teruggeven
-    if isinstance(data, list) and data:
-        env = data[0]
-    elif isinstance(data, dict):
-        env = data
-    else:
-        return []
+            if not DEBUG_LOG_DONE:
+                print("\n================ DEBUG (eenmalig) ================\n")
+                print(json.dumps(data, indent=2))
+                print("\n==================================================\n")
+                DEBUG_LOG_DONE = True
 
-    result = env.get("result", [])
+            env = data[0] if isinstance(data, list) else data
+            result = env.get("result", [])
 
-    # result kan óók weer lijst of dict zijn
-    if isinstance(result, list):
-        # als het direct een lijst van slots is
-        return result
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict):
+                return result.get("availability") or result.get("slots") or []
 
-    if isinstance(result, dict):
-        slots = (
-            result.get("availability")
-            or result.get("slots")
-            or result.get("timeSlots")
-            or []
-        )
-        if isinstance(slots, list):
-            return slots
+            return []
+        except:
+            time.sleep(0.3)
 
-    # Als we hier komen is de structuur onbekend → geen slots
     return []
 
 
 # ==========================
-# AVAILABILITY VOOR ÉÉN AUTO
+# AVAILABILITY VOOR AUTO
 # ==========================
 
-def build_availability_for_car(resource_id: int, license_clean: str,
-                               start_dt: datetime, end_dt: datetime):
-
-    # Haal MyWheels blokken op
-    try:
-        slots = fetch_calendar_availability(resource_id, start_dt, end_dt)
-    except Exception as e:
-        print(f"⚠️ Fout bij resource {resource_id}: {e}")
-        return {
-            "no_availability_all_day": False,
-            "conflict_tijden": "",
-        }
+def build_availability_for_car(resource_id, start_dt, end_dt):
+    slots = fetch_calendar_availability(resource_id, start_dt, end_dt)
 
     conflict_blocks = []
 
-    # MyWheels geeft BEZETTE BLOKKEN met:
-    # startDate, endDate, refuelTime
     for slot in slots:
         if not isinstance(slot, dict):
             continue
-        
+
         start_str = slot.get("startDate")
-        end_str   = slot.get("endDate")
-        refuel    = slot.get("refuelTime", 0)
+        end_str = slot.get("endDate")
+        refuel = slot.get("refuelTime", 0)
 
         if not start_str or not end_str:
             continue
-        
+
         try:
             s = parse_slot_datetime(start_str)
             e = parse_slot_datetime(end_str)
-        except Exception:
+        except:
             continue
 
-        # refuelTime toevoegen → "uitloop-blokkade"
         if isinstance(refuel, (int, float)):
             e += timedelta(minutes=refuel)
 
-        # Alleen blokken in ons window
         if e <= start_dt or s >= end_dt:
             continue
 
-        # Clip aan window
         s = max(s, start_dt)
         e = min(e, end_dt)
 
         conflict_blocks.append((s, e))
 
-    # Merge overlappende blokken
     conflict_blocks = merge_blocks(conflict_blocks)
 
-    # Zoek of er 30 min vrije ruimte is
     free_period_found = False
     current = start_dt
 
     for s, e in conflict_blocks:
-        if s > current:
-            if (s - current) >= timedelta(minutes=FREE_REQUIRED_MINUTES):
-                free_period_found = True
-                break
+        if s > current and (s - current) >= timedelta(minutes=FREE_REQUIRED_MINUTES):
+            free_period_found = True
+            break
         current = max(current, e)
 
-    # Check na laatste blok
-    if current < end_dt:
-        if (end_dt - current) >= timedelta(minutes=FREE_REQUIRED_MINUTES):
-            free_period_found = True
+    if not free_period_found and (end_dt - current) >= timedelta(minutes=FREE_REQUIRED_MINUTES):
+        free_period_found = True
 
     no_availability_all_day = not free_period_found
 
-    # Marge: alleen als auto NIET all-day bezet is
     if not no_availability_all_day:
         corrected = []
-
         for s, e in conflict_blocks:
-            new_s = s
-            new_e = e
-
             if e < end_dt:
-                new_e -= timedelta(minutes=BLOCK_MINUTES)
-
+                e -= timedelta(minutes=BLOCK_MINUTES)
             if s > start_dt:
-                new_s += timedelta(minutes=BLOCK_MINUTES)
-
-            if new_e > new_s:
-                corrected.append((new_s, new_e))
-
+                s += timedelta(minutes=BLOCK_MINUTES)
+            if e > s:
+                corrected.append((s, e))
         conflict_blocks = merge_blocks(corrected)
-
-    conflict_str = format_blocks(conflict_blocks) if conflict_blocks else ""
 
     return {
         "no_availability_all_day": no_availability_all_day,
-        "conflict_tijden": conflict_str,
+        "conflict_tijden": format_blocks(conflict_blocks) if conflict_blocks else ""
     }
 
 
@@ -335,7 +233,6 @@ def build_availability_for_car(resource_id: int, license_clean: str,
 # ==========================
 
 def main():
-    # Start & eind in lokale tijd
     now = datetime.now().replace(second=0, microsecond=0)
     start_dt = now
     end_dt = now + timedelta(hours=WINDOW_HOURS)
@@ -344,30 +241,28 @@ def main():
 
     cars = load_cars_from_sheet()
     if not cars:
-        print("⚠️ Geen auto's om te verwerken, stoppen.")
+        print("⚠️ Geen auto's om te verwerken.")
         return
 
     availability = {}
 
     for idx, car in enumerate(cars, start=1):
         rid = car["resource_id"]
-        lic_clean = car["license_clean"] or f"ID_{rid}"
+        license_clean = car["license_clean"]
 
-        print(f"🔎 [{idx}/{len(cars)}] resource {rid} ({lic_clean})")
+        print(f"🔎 [{idx}/{len(cars)}] {rid} ({license_clean})")
 
-        entry = build_availability_for_car(rid, lic_clean, start_dt, end_dt)
-        availability[lic_clean] = entry
+        availability[license_clean] = build_availability_for_car(
+            rid, start_dt, end_dt
+        )
 
-        # Klein sleepje om 429 risico nog kleiner te maken
-        time.sleep(0.2)
+        time.sleep(0.05)   # <-- 🔥 SNELLER EN VEILIG
 
-    # JSON in repo-root (voor GitHub Pages)
-    out_path = "availability.json"
-    with open(out_path, "w", encoding="utf-8") as f:
+    with open("availability.json", "w", encoding="utf-8") as f:
         json.dump(availability, f, ensure_ascii=False, indent=2)
 
-    print(f"✅ availability.json opgeslagen in {out_path}")
-    print(f"🚗 Totaal {len(availability)} auto's verwerkt.")
+    print("✅ availability.json opgeslagen")
+    print(f"🚗 {len(availability)} auto's verwerkt.")
 
 
 if __name__ == "__main__":
